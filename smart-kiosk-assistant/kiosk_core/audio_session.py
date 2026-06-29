@@ -66,6 +66,8 @@ class BaseAudioSession:
         preroll_frames = max(1, int(config.DEFAULT_PREROLL_SECONDS / self._frame_duration_seconds))
         self._preroll_frames: deque[np.ndarray] = deque(maxlen=preroll_frames)
         self._session_output_dir = Path(__file__).resolve().parent.parent / "generated_audio" / self.session_id
+        # Ensure output directory exists
+        self._session_output_dir.mkdir(parents=True, exist_ok=True)
 
     def start(self) -> None:
         with self._lock:
