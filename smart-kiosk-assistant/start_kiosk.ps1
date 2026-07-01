@@ -101,6 +101,15 @@ function Load-Env {
 # Service definitions
 $Services = @(
     @{
+        Name = "metrics-collector"
+        Port = 9000
+        Path = "$KioskDir\kiosk_core\metrics-collector\windows"
+        MainFile = "metrics_collector.ps1"
+        HealthUrl = "http://127.0.0.1:9000/health"
+        Description = "System Metrics Collector"
+        Runtime = "powershell"
+    },
+    @{
         Name = "text-to-speech"
         Port = 8011
         Path = "$EdgeAIDir\microservices\text-to-speech"
@@ -162,6 +171,34 @@ function Test-ServiceHealth {
 # Start a single service
 function Start-Service {
     param($Service)
+
+    if ($Service.Runtime -eq "powershell") {
+        $MainFile = Join-Path $Service.Path $Service.MainFile
+
+        if (-not (Test-Path $MainFile)) {
+            Write-Error-Custom "Main file not found for $($Service.Name)"
+            Write-Error-Custom "  Expected: $MainFile"
+            return $false
+        }
+
+        try {
+            $Job = Start-Job -ScriptBlock {
+                param($MainFile, $ServicePath)
+                Set-Location $ServicePath
+                powershell -ExecutionPolicy Bypass -File $MainFile
+            } -ArgumentList $MainFile, $Service.Path
+
+            $Global:ProcessJobs[$Service.Name] = $Job
+            $Global:ServiceHealth[$Service.Name] = $false
+
+            Write-Log "Starting ($($Service.Description))..." $Service.Name
+            return $true
+        }
+        catch {
+            Write-Error-Custom "Failed to start $($Service.Name): $_"
+            return $false
+        }
+    }
     
     $VenvPath = Join-Path $Service.Path "venv"
     $PythonExe = Join-Path $VenvPath "Scripts\python.exe"

@@ -21,6 +21,8 @@ class QueryRequest(BaseModel):
     context_text: str | None = Field(default=None, max_length=10_000)
     top_k: int | None = Field(default=None, ge=1, le=20)
     include_sources: bool = False
+    include_performance_metrics: bool = False
+    include_llm_metrics: bool = False
     # Recent conversation turns prior to `transcription`, oldest-first. Used so
     # follow-ups like 'are you sure?' resolve against the last exchange. The
     # pipeline trims/drops oldest turns when the context budget is tight.

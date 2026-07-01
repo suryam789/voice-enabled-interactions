@@ -51,6 +51,9 @@ class BaseAudioSession:
         self.response_parts: list[str] = []
         self.tts_audio_segments: list[dict[str, object]] = []
         self.tts_errors: list[str] = []
+        self.performance_metrics: dict[str, object] = {}
+        self.llm_metrics: dict[str, object] = {}
+        self.rag_sources: list[dict[str, object]] = []
         self.stop_requested_at: datetime | None = None
 
         self._lock = threading.Lock()
@@ -109,6 +112,9 @@ class BaseAudioSession:
                 "response_parts": list(self.response_parts),
                 "tts_audio_segments": [dict(segment) for segment in self.tts_audio_segments],
                 "tts_errors": list(self.tts_errors),
+                "performance_metrics": dict(self.performance_metrics),
+                "llm_metrics": dict(self.llm_metrics),
+                "sources": list(self.rag_sources),
             }
 
     def _run(self) -> None:
@@ -235,8 +241,33 @@ class BaseAudioSession:
         print(f"\nRAG response for session {self.session_id}:\n", end="", flush=True)
         sentence_index = 0
         history = list(getattr(self.request, "history", []) or [])
+
+        def _handle_rag_event(event: dict) -> None:
+            if event.get("event") == "metrics":
+                with self._lock:
+                    perf = event.get("performance_metrics")
+                    llm = event.get("llm_metrics")
+                    if isinstance(perf, dict):
+                        self.performance_metrics = dict(perf)
+                    if isinstance(llm, dict):
+                        self.llm_metrics = dict(llm)
+                return
+
+            if event.get("event") == "sources":
+                sources = event.get("sources")
+                if isinstance(sources, list):
+                    with self._lock:
+                        self.rag_sources = [s for s in sources if isinstance(s, dict)]
+
         try:
-            for token in self.rag_client.stream_answer(transcript, history=history):
+            for token in self.rag_client.stream_answer(
+                transcript,
+                history=history,
+                include_sources=bool(getattr(self.request, "include_sources", False)),
+                include_performance_metrics=bool(getattr(self.request, "include_performance_metrics", True)),
+                include_llm_metrics=bool(getattr(self.request, "include_llm_metrics", True)),
+                on_event=_handle_rag_event,
+            ):
                 with self._lock:
                     self.response_parts.append(token)
                 print(token, end="", flush=True)
@@ -254,6 +285,29 @@ class BaseAudioSession:
         finally:
             sentence_queue.put((None, None))
             worker.join()
+            # Ubuntu implementation surfaces LLM metrics from rag-service
+            # /api/v1/performance. Keep that behavior as a fallback when
+            # SSE metrics events are not emitted by the query path.
+            with self._lock:
+                missing_metrics = (not self.performance_metrics) or (not self.llm_metrics)
+            if missing_metrics:
+                try:
+                    perf_payload = self.rag_client.get_performance_metrics()
+                    latency = perf_payload.get("latency") if isinstance(perf_payload, dict) else None
+                    if isinstance(latency, dict):
+                        with self._lock:
+                            if not self.performance_metrics:
+                                self.performance_metrics = {
+                                    "retrieval": latency.get("retrieval") or {},
+                                    "llm": latency.get("llm") or {},
+                                }
+                            if not self.llm_metrics:
+                                llm = latency.get("llm")
+                                self.llm_metrics = dict(llm) if isinstance(llm, dict) else {}
+                except Exception:
+                    # Keep streaming response resilient if performance endpoint
+                    # is temporarily unavailable.
+                    pass
             print(flush=True)
 
     @staticmethod

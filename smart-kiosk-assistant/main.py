@@ -98,6 +98,9 @@ def start_file_session(
     tts_language: str | None = Form("English"),
     tts_instructions: str | None = Form(None),
     realtime_factor: float = Form(1.0),
+    include_sources: bool = Form(False),
+    include_performance_metrics: bool = Form(True),
+    include_llm_metrics: bool = Form(True),
 ) -> dict[str, object]:
     request = FileSessionStartRequest(
         device=device,
@@ -116,6 +119,9 @@ def start_file_session(
         tts_language=tts_language,
         tts_instructions=tts_instructions,
         realtime_factor=realtime_factor,
+        include_sources=include_sources,
+        include_performance_metrics=include_performance_metrics,
+        include_llm_metrics=include_llm_metrics,
     )
     try:
         return service.start_file_session(request, file)

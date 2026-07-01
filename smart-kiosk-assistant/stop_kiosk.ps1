@@ -40,8 +40,9 @@ function Write-Error-Custom {
 
 Write-Header "SMART KIOSK ASSISTANT - SHUTDOWN"
 
-$Services = @("text-to-speech", "audio-analyzer", "rag-service", "kiosk-core", "kiosk-ui")
+$Services = @("metrics-collector", "text-to-speech", "audio-analyzer", "rag-service", "kiosk-core", "kiosk-ui")
 $Ports = @{
+    "metrics-collector" = 9000
     "text-to-speech" = 8011
     "audio-analyzer" = 8010
     "rag-service" = 8020

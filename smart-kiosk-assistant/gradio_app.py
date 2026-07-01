@@ -25,6 +25,7 @@ TTS_URL                 = os.getenv("KIOSK_CORE_UI_TTS_URL",            "http://
 ANALYZER_URL            = os.getenv("KIOSK_CORE_UI_ANALYZER_URL",       "http://127.0.0.1:8010/v1/audio/transcriptions")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("KIOSK_CORE_UI_TIMEOUT_SECONDS",       "120.0"))
 POLL_INTERVAL_SECONDS   = float(os.getenv("KIOSK_CORE_UI_POLL_INTERVAL_SECONDS", "0.35"))
+PERF_REFRESH_SECONDS    = float(os.getenv("KIOSK_CORE_UI_PERF_REFRESH_SECONDS", "1.0"))
 _CHUNK_SECONDS          = kiosk_config.DEFAULT_CHUNK_SECONDS
 _SAMPLE_KB_DIR          = os.path.join(os.path.dirname(__file__), "knowledge-base-samples")
 _SAMPLE_KB_OPTIONS      = {
@@ -33,6 +34,7 @@ _SAMPLE_KB_OPTIONS      = {
     "SkyJet (Airline)": os.path.join(_SAMPLE_KB_DIR, "SkyJet-S.md"),
 }
 _DEFAULT_SAMPLE_KB      = next(iter(_SAMPLE_KB_OPTIONS))
+_LAST_METRICS_PAYLOAD: dict[str, Any] = {}
 
 # ── Derived base URLs for KPI endpoints ──────────────────────────────────────
 def _svc_base(full_url: str) -> str:
@@ -1064,6 +1066,8 @@ def _open_session(sr: int, history: list[dict] | None = None) -> dict[str, Any]:
             "analyzer_url": ANALYZER_URL, "rag_url": RAG_URL, "tts_url": TTS_URL,
             "tts_model": "speecht5", "tts_language": "English",
             "history": _recent_history_payload(history),
+            "include_performance_metrics": True,
+            "include_llm_metrics": True,
         })
     r.raise_for_status(); return r.json()
 
@@ -1350,13 +1354,18 @@ def _render_kpi_html(asr: dict, rag: dict, tts: dict) -> str:
 # ── Metrics / Performance helpers ────────────────────────────────────────────
 def _fetch_metrics() -> dict:
     """Fetch time-series metrics via kiosk-core proxy endpoint."""
+    global _LAST_METRICS_PAYLOAD
     try:
         with httpx.Client(timeout=4.0, trust_env=False) as c:
             r = c.get(f"{KIOSK_CORE_URL}/api/v1/metrics")
             r.raise_for_status()
-            return r.json()
+            payload = r.json()
+            if isinstance(payload, dict) and payload:
+                _LAST_METRICS_PAYLOAD = payload
+            return payload
     except Exception:
-        return {}
+        # Keep charts moving with the latest known series during transient outages.
+        return _LAST_METRICS_PAYLOAD if isinstance(_LAST_METRICS_PAYLOAD, dict) else {}
 
 
 def _make_line_fig(
@@ -1504,7 +1513,7 @@ def create_app() -> gr.Blocks:
                     ingest_status = gr.HTML(value="")
 
                 with gr.Accordion(label="📈 Performance", open=True):
-                    perf_timer = gr.Timer(value=10, active=True)
+                    perf_timer = gr.Timer(value=PERF_REFRESH_SECONDS, active=True)
                     cpu_plot = gr.Plot(label="CPU", show_label=False)
                     gpu_plot = gr.Plot(label="GPU", show_label=False)
                     mem_plot = gr.Plot(label="Memory", show_label=False)

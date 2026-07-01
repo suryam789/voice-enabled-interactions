@@ -141,6 +141,17 @@ def query_context(request: QueryRequest) -> StreamingResponse:
         except Exception as exc:  # noqa: BLE001
             yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
+            if request.include_performance_metrics or request.include_llm_metrics:
+                metrics_payload: dict[str, object] = {"event": "metrics"}
+                if request.include_performance_metrics:
+                    metrics_payload["performance_metrics"] = {
+                        "retrieval": retrieval_latency.stats(),
+                        "llm": llm_latency.stats(),
+                    }
+                if request.include_llm_metrics:
+                    metrics_payload["llm_metrics"] = llm_latency.stats()
+                yield f"data: {json.dumps(metrics_payload, ensure_ascii=False)}\n\n"
+
             if request.include_sources and sources:
                 payload = {
                     "event": "sources",

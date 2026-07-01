@@ -28,6 +28,9 @@ class SessionStartRequest(BaseModel):
     # Recent conversation turns prior to this question, oldest-first.
     # Forwarded verbatim to the RAG service so follow-ups have context.
     history: list[dict[str, str]] = Field(default_factory=list)
+    include_sources: bool = False
+    include_performance_metrics: bool = True
+    include_llm_metrics: bool = True
 
 
 class FileSessionStartRequest(SessionStartRequest):
