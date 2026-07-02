@@ -15,7 +15,8 @@
 
 param(
     [switch]$Silent = $false,  # Suppress extra output
-    [switch]$NoBrowser = $false  # Don't auto-open browser
+    [switch]$NoBrowser = $false,  # Don't auto-open browser
+    [int]$StartupTimeoutSeconds = 600  # First-run model warmup can take several minutes
 )
 
 $ErrorActionPreference = "Stop"
@@ -160,7 +161,7 @@ function Test-ServiceHealth {
     }
     
     try {
-        $Response = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 2 -ErrorAction SilentlyContinue
+        $Response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 2 -ErrorAction SilentlyContinue
         return $Response.StatusCode -eq 200
     }
     catch {
@@ -168,9 +169,56 @@ function Test-ServiceHealth {
     }
 }
 
+function Get-ListeningPid {
+    param([int]$Port)
+
+    try {
+        $Conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Conn -and $Conn.OwningProcess) {
+            return [int]$Conn.OwningProcess
+        }
+    }
+    catch {}
+
+    try {
+        $Line = netstat -ano | Select-String ":$Port " | Select-String "LISTENING" | Select-Object -First 1
+        if ($Line) {
+            $Pid = ($Line.ToString().Trim() -split '\s+')[-1]
+            if ($Pid -match '^\d+$') {
+                return [int]$Pid
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
 # Start a single service
 function Start-Service {
     param($Service)
+
+    if ($Service.Port) {
+        $ExistingPid = Get-ListeningPid -Port $Service.Port
+        if ($ExistingPid) {
+            $IsHealthyExisting = Test-ServiceHealth -HealthUrl $Service.HealthUrl
+            if ($IsHealthyExisting) {
+                $Global:ServiceHealth[$Service.Name] = $true
+                Write-Log "[READY] Reusing existing healthy process on port $($Service.Port) (PID $ExistingPid)" $Service.Name
+                return $true
+            }
+
+            if ($Service.Name -eq "metrics-collector") {
+                $Global:ServiceHealth[$Service.Name] = $true
+                Write-Info "metrics-collector port $($Service.Port) is owned by PID $ExistingPid and not healthy; continuing without metrics collection"
+                return $true
+            }
+
+            Write-Error-Custom "Port $($Service.Port) already in use for $($Service.Name) (PID $ExistingPid), but health check is failing"
+            Write-Error-Custom "  Stop the existing process or run stop_kiosk.ps1 -Force, then retry"
+            return $false
+        }
+    }
 
     if ($Service.Runtime -eq "powershell") {
         $MainFile = Join-Path $Service.Path $Service.MainFile
@@ -248,32 +296,52 @@ function Monitor-Services {
         
         foreach ($Service in $Services) {
             $Job = $Global:ProcessJobs[$Service.Name]
-            
-            # Check if job is still running
-            if ($Job.State -eq "Failed" -or $Job.State -eq "Completed") {
-                if ($Job.State -eq "Failed") {
-                    Write-Error-Custom "Service $($Service.Name) failed to start"
-                    $Errors = Receive-Job -Job $Job -ErrorAction SilentlyContinue
-                    if ($Errors) {
-                        Write-Error-Custom "  Error: $($Errors[0])"
-                    }
+
+            if (-not $Job) {
+                $IsHealthy = Test-ServiceHealth -HealthUrl $Service.HealthUrl
+                $Global:ServiceHealth[$Service.Name] = $IsHealthy
+                if ($IsHealthy) {
+                    $HealthyCount++
                 }
                 continue
             }
-            
-            # Check health
+
+            # Prefer health over job state. Some servers (notably Gradio under
+            # background jobs) can detach and leave the parent job Completed
+            # while the service continues serving on its port.
             $IsHealthy = Test-ServiceHealth -HealthUrl $Service.HealthUrl
             $Global:ServiceHealth[$Service.Name] = $IsHealthy
-            
             if ($IsHealthy) {
                 $HealthyCount++
                 if (-not $Silent) {
                     Write-Log "[READY] Ready on port $($Service.Port)" $Service.Name
                 }
+                continue
             }
-            else {
-                Write-Log "[WAIT] Starting..." $Service.Name
+            
+            # Check if job exited before becoming healthy
+            if ($Job.State -eq "Failed" -or $Job.State -eq "Completed" -or $Job.State -eq "Stopped") {
+                if ($Service.Name -eq "metrics-collector") {
+                    $Global:ServiceHealth[$Service.Name] = $true
+                    Write-Info "metrics-collector exited during startup; continuing without metrics collection"
+                    continue
+                }
+
+                Write-Error-Custom "Service $($Service.Name) exited before becoming healthy (state: $($Job.State))"
+
+                $Output = Receive-Job -Job $Job -Keep -ErrorAction SilentlyContinue
+                if ($Output) {
+                    $Tail = @($Output | Select-Object -Last 8)
+                    foreach ($Line in $Tail) {
+                        if ($Line) {
+                            Write-Log "[EXIT] $Line" $Service.Name
+                        }
+                    }
+                }
+                continue
             }
+
+            Write-Log "[WAIT] Starting..." $Service.Name
         }
         
         # All services healthy?
@@ -286,6 +354,11 @@ function Monitor-Services {
     }
     
     if (-not $AllHealthy) {
+        $Pending = @($Services | Where-Object { -not $Global:ServiceHealth[$_.Name] } | ForEach-Object { $_.Name })
+        if ($Pending.Count -gt 0) {
+            Write-Info "Startup timed out after $TimeoutSeconds seconds"
+            Write-Info "Still not healthy: $($Pending -join ', ')"
+        }
         Write-Info "Note: Some services may still be initializing (first run can take longer)"
     }
     
@@ -397,7 +470,7 @@ Write-Info "Started $StartedCount/$($Services.Count) services"
 
 # Monitor health
 Write-Step "Waiting for services to be ready..."
-$AllHealthy = Monitor-Services -TimeoutSeconds 120
+$AllHealthy = Monitor-Services -TimeoutSeconds $StartupTimeoutSeconds
 
 if ($AllHealthy) {
     Write-Header "ALL SERVICES RUNNING"
@@ -418,8 +491,19 @@ if ($AllHealthy) {
     }
 }
 else {
-    Write-Error-Custom "Some services failed to start"
-    Write-Info "Check the logs above for details"
+    $RunningUnhealthy = @($Services | Where-Object {
+        $job = $Global:ProcessJobs[$_.Name]
+        $job -and $job.State -eq "Running" -and -not $Global:ServiceHealth[$_.Name]
+    } | ForEach-Object { $_.Name })
+
+    if ($RunningUnhealthy.Count -gt 0) {
+        Write-Info "Some services are still initializing: $($RunningUnhealthy -join ', ')"
+        Write-Info "If this is first run, keep this window open and wait for model warmup/download to complete"
+    }
+    else {
+        Write-Error-Custom "Some services failed to start"
+        Write-Info "Check the logs above for details"
+    }
 }
 
 # Show unified logs

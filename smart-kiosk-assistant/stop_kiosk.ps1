@@ -56,24 +56,51 @@ foreach ($Service in $Services) {
     $Port = $Ports[$Service]
     
     try {
-        # Find processes listening on the port
-        $ProcessInfo = netstat -ano | Select-String ":$Port " | Select-String "LISTENING"
-        
-        if ($ProcessInfo) {
-            $Matches = [regex]::Matches($ProcessInfo, '(\d+)\s+LISTENING')
-            foreach ($Match in $Matches) {
-                $ProcessId = $Match.Groups[1].Value
-                
-                if ($Force) {
-                    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-                    Write-Success "$Service (PID $ProcessId) force stopped"
+        # Find listener PID using PowerShell TCP APIs first, then netstat fallback
+        $ProcessIds = @()
+
+        try {
+            $Conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+            if ($Conn) {
+                $ProcessIds += @($Conn | Select-Object -ExpandProperty OwningProcess)
+            }
+        }
+        catch {}
+
+        if (-not $ProcessIds) {
+            $NetstatLines = netstat -ano | Select-String ":$Port " | Select-String "LISTENING"
+            foreach ($Line in $NetstatLines) {
+                $PidToken = ($Line.ToString().Trim() -split '\s+')[-1]
+                if ($PidToken -match '^\d+$') {
+                    $ProcessIds += [int]$PidToken
                 }
-                else {
-                    Stop-Process -Id $ProcessId -ErrorAction SilentlyContinue
-                    Write-Success "$Service (PID $ProcessId) stopped"
+            }
+        }
+
+        $ProcessIds = @($ProcessIds | Sort-Object -Unique | Where-Object { $_ -gt 0 })
+
+        if ($ProcessIds.Count -gt 0) {
+            foreach ($ProcessId in $ProcessIds) {
+                if ($ProcessId -le 4) {
+                    Write-Info "$Service is bound by system process PID $ProcessId; skipping"
+                    continue
                 }
-                
-                $StoppedCount++
+
+                try {
+                    if ($Force) {
+                        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+                        Write-Success "$Service (PID $ProcessId) force stopped"
+                    }
+                    else {
+                        Stop-Process -Id $ProcessId -ErrorAction Stop
+                        Write-Success "$Service (PID $ProcessId) stopped"
+                    }
+
+                    $StoppedCount++
+                }
+                catch {
+                    Write-Error-Custom "Could not stop $Service (PID $ProcessId): $($_.Exception.Message)"
+                }
             }
         }
         else {

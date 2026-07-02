@@ -1038,6 +1038,26 @@ def _numpy_to_wav(audio: np.ndarray, sr: int) -> bytes:
         wf.writeframes(audio.astype(np.int16).tobytes())
     return buf.getvalue()
 
+
+def _to_int16_audio(data: np.ndarray) -> np.ndarray:
+    """Normalize incoming Gradio audio to mono int16.
+
+    Gradio can provide float32 samples in [-1, 1] or integer PCM depending on
+    browser/runtime. Converting float directly with astype(int16) collapses most
+    speech to zeros; scale first when data is floating-point.
+    """
+    if data.ndim > 1:
+        data = data[:, 0]
+
+    if np.issubdtype(data.dtype, np.floating):
+        clipped = np.clip(data, -1.0, 1.0)
+        return (clipped * 32767.0).astype(np.int16)
+
+    if data.dtype != np.int16:
+        return data.astype(np.int16)
+
+    return data
+
 def _recent_history_payload(history: list[dict] | None, max_turns: int = 4) -> list[dict[str, str]]:
     """Return the last `max_turns` chat turns in {role, content} form for the
     RAG service. `state["history"]` stores entries as {"role", "text"}; we
@@ -1135,8 +1155,7 @@ def on_chunk(state: dict, chunk):
     sr, data = chunk
     if data is None or len(data) == 0:
         return state, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
-    if data.ndim > 1: data = data[:, 0]
-    data = data.astype(np.int16)
+    data = _to_int16_audio(data)
 
     s = dict(state); s["sample_rate"] = sr
     new_data = _extract_new_stream_audio(s.get("stream_prev"), data)
@@ -1169,11 +1188,29 @@ def on_chunk(state: dict, chunk):
     partial = transcript or "🎤  Listening…"
     return s, _render_chat(s["history"], partial_user=partial), gr.skip(), gr.skip(), "🎙  Listening — speak now", gr.skip()
 
-def on_stop(state: dict) -> Generator:
+def on_stop(state: dict, mic_value) -> Generator:
     s = dict(state)
     sid = s.get("session_id"); sr = s.get("sample_rate", 16000)
     history = list(s.get("history", []))
     seen = 0
+
+    # Fallback path: when streaming chunk callbacks do not arrive (seen on some
+    # remote/browser setups), use the final recorded clip emitted at stop.
+    if not sid and mic_value is not None:
+        try:
+            fsr, fdata = mic_value
+            if fdata is not None and len(fdata) > 0:
+                fdata_i16 = _to_int16_audio(fdata)
+                if len(fdata_i16) > 0:
+                    sr = int(fsr or sr)
+                    sid = _open_session(sr, history=s.get("history"))["session_id"]
+                    _push(sid, _numpy_to_wav(fdata_i16, sr))
+                    _eos(sid)
+                    s["session_id"] = sid
+                    s["sample_rate"] = sr
+        except Exception:
+            # Keep existing UX path below if fallback cannot initialize.
+            sid = s.get("session_id")
 
     if not sid:
         yield s, _render_chat(history), gr.update(value=None), gr.skip(), "No audio — try again", ""
@@ -1538,7 +1575,7 @@ def create_app() -> gr.Blocks:
 
         mic.start_recording(fn=on_start, inputs=[state],         outputs=outs)
         mic.stream(         fn=on_chunk, inputs=[state, mic],    outputs=outs, stream_every=0.5)
-        mic.stop_recording( fn=on_stop,  inputs=[state],         outputs=outs)
+        mic.stop_recording( fn=on_stop,  inputs=[state, mic],    outputs=outs)
 
         tts_queue.change(
             fn=None,
